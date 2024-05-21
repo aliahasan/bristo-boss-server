@@ -4,6 +4,7 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const port = process.env.PORT || 5000;
 require("dotenv").config();
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
 app.use(
   cors({
@@ -31,7 +32,8 @@ async function run() {
     const userCollection = client.db("bistroDB").collection("users");
     const menuCollection = client.db("bistroDB").collection("menu");
     const reviewsCollection = client.db("bistroDB").collection("reviews");
-    const cartCollectin = client.db("bistroDB").collection("cart");
+    const cartCollection = client.db("bistroDB").collection("cart");
+    const paymentCollection = client.db("bistroDB").collection("payments");
 
     // jwt realted api
     app.post("/jwt", async (req, res) => {
@@ -45,7 +47,6 @@ async function run() {
     // middlewares
 
     const verifyToken = (req, res, next) => {
-      // console.log("inside verify token", req.headers.authorization);
       if (!req.headers?.authorization) {
         return res.status(401).send({ message: "unauthorized  access" });
       }
@@ -172,7 +173,7 @@ async function run() {
       const item = req.body;
       const id = req.params.id;
       const filter = {
-        $or: [{ _id: id }, { _id: new ObjectId(id) }],
+        $or: [{ _id: id }, { _id: id }],
       };
       const updatedDoc = {
         $set: {
@@ -195,22 +196,145 @@ async function run() {
     // create carts collection
     app.post("/carts", async (req, res) => {
       const cartItem = req.body;
-      const result = await cartCollectin.insertOne(cartItem);
+      const result = await cartCollection.insertOne(cartItem);
       res.send(result);
     });
 
     app.get("/carts", async (req, res) => {
       const email = req.query.email;
       const query = { email: email };
-      const result = await cartCollectin.find(query).toArray();
+      const result = await cartCollection.find(query).toArray();
       res.send(result);
     });
 
     app.delete("/carts/:id", async (req, res) => {
       const id = req.params.id;
       const query = { _id: new ObjectId(id) };
-      const result = await cartCollectin.deleteOne(query);
+      const result = await cartCollection.deleteOne(query);
       res.send(result);
+    });
+
+    // payment intent
+    app.post("/create-payment-intent", async (req, res) => {
+      try {
+        const { price } = req.body;
+        const amount = parseInt(price * 100);
+        console.log(amount, "amount inside the intent");
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: amount,
+          currency: "usd",
+          payment_method_types: ["card"],
+        });
+        res.send({
+          clientSecret: paymentIntent.client_secret,
+        });
+      } catch (error) {
+        console.log(error);
+      }
+    });
+
+    app.get("/payments/:email", verifyToken, async (req, res) => {
+      try {
+        const query = { email: req.params.email };
+        if (req.params.email !== req.user.email) {
+          return res.status(403).send({ message: "forbidden access" });
+        }
+        const result = await paymentCollection.find(query).toArray();
+        res.send(result);
+      } catch (error) {
+        console.log(error);
+      }
+    });
+
+    // payment related api
+
+    app.post("/payments", async (req, res) => {
+      try {
+        const payment = req.body;
+        const paymentResult = await paymentCollection.insertOne(payment);
+        console.log("payment info", payment);
+
+        const query = {
+          _id: {
+            $in: payment.cartIds.map((id) => new ObjectId(id)),
+          },
+        };
+        const deleteResult = await cartCollection.deleteMany(query);
+
+        res.send({
+          paymentResult,
+          deleteResult,
+        });
+      } catch (error) {
+        console.error("Error processing payment:", error);
+        res
+          .status(500)
+          .send({ error: "An error occurred while processing the payment." });
+      }
+    });
+
+    // stats or analytics calculate total revenue
+    app.get("/admin-stats", verifyToken, verifyAdmin, async (req, res) => {
+      const users = await userCollection.estimatedDocumentCount();
+      const menuItems = await menuCollection.estimatedDocumentCount();
+      const orders = await paymentCollection.estimatedDocumentCount();
+      const result = await paymentCollection
+        .aggregate([
+          {
+            $group: {
+              _id: null,
+              totalRevenue: {
+                $sum: "$price",
+              },
+            },
+          },
+        ])
+        .toArray();
+      const revenue = result.length > 0 ? result[0].totalRevenue : 0;
+      res.send({ users, menuItems, orders, revenue });
+    });
+
+    // using aggregate pipeline count total item sell and each category sell and revenue per category
+
+    app.get("/order-stats", verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const result = await paymentCollection
+          .aggregate([
+            {
+              $unwind: "$menuItemIds",
+            },
+            {
+              $lookup: {
+                from: "menu",
+                localField: "menuItemIds",
+                foreignField: "_id",
+                as: "menuItems",
+              },
+            },
+            {
+              $unwind: "$menuItems",
+            },
+            {
+              $group: {
+                _id: "$menuItems.category",
+                quantity: { $sum: 1 },
+                revenue: { $sum: "$menuItems.price" },
+              },
+            },
+            {
+              $project: {
+                _id: 0,
+                category: "$_id",
+                quantity: "$quantity",
+                revenue: "$revenue",
+              },
+            },
+          ])
+          .toArray();
+        res.send(result);
+      } catch (error) {
+        console.log(error);
+      }
     });
 
     await client.db("admin").command({ ping: 1 });
@@ -229,5 +353,5 @@ app.get("/", (req, res) => {
 });
 
 app.listen(port, () => {
-  console.log(`Bistro boss is runnning on server ${port}`);
+  console.log(`Bistro boss is running on server ${port}`);
 });
